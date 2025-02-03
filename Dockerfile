@@ -6,7 +6,6 @@ WORKDIR /app
 
 # Copy only necessary files
 COPY requirements.txt bot.py ./
-COPY config/approved_users.txt ./config/approved_users.txt
 
 # Install dependencies
 RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
