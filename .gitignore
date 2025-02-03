@@ -176,3 +176,4 @@ __pycache__/
 venv/
 .DS_Store
 /data/
+approved_users.txt

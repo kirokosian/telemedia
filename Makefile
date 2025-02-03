@@ -5,7 +5,21 @@ IMAGE_NAME := telemedia-bot
 TAG := latest
 DOCKERFILE := Dockerfile
 
-# Ensure TELEGRAM_BOT_TOKEN is set before allowing run.
+TELEMEDIA_DB := ./data/db
+TELEMEDIA_CONFIG := ./data/config
+TELEMEDIA_MOVIES := ./data/movies
+TELEMEDIA_TV := ./data/tv
+TELEMEDIA_DOWNLOADS := ./data/downloads
+SMA_CONFIG := ./data/config/sma_config
+
+
+# Include .env file if it exists
+-include .env
+
+# Export all variables to sub-processes
+export
+
+# Ensure TELEGRAM_BOT_TOKEN, PUID, and PGID are set before allowing run.
 ifndef TELEGRAM_BOT_TOKEN
 $(error TELEGRAM_BOT_TOKEN environment variable is not set. Please export TELEGRAM_BOT_TOKEN before running 'make run'.)
 endif
@@ -16,15 +30,15 @@ endif
 build:
 	docker build -t $(IMAGE_NAME):$(TAG) -f $(DOCKERFILE) .
 
-# Run the container with volume mounts and the TELEGRAM_BOT_TOKEN from the environment.
-# Adjust the host paths as needed.
+# Run the container with user defined by PUID and PGID, volume mounts, and exported environment variables.
 run:
 	docker run -d \
-	  -v "$(TELEMEDIA_DB)":/app/db \
-	  -v "$(TELEMEDIA_CONFIG)":/app/config \
-	  -v "$(TELEMEDIA_MOVIES)":/app/movies \
-	  -v "$(TELEMEDIA_TV)":/app/tv \
-	  -v "$(TELEMEDIA_DOWNLOADS)":/app/downloads \
+	  -v $(TELEMEDIA_DB):/app/db \
+	  -v $(TELEMEDIA_CONFIG):/app/config \
+	  -v $(TELEMEDIA_MOVIES):/app/movies \
+	  -v $(TELEMEDIA_TV):/app/tv \
+	  -v $(TELEMEDIA_DOWNLOADS):/app/downloads \
+	  -v $(SMA_CONFIG):/app/sickbeard_mp4_automator/config \
 	  -e TELEGRAM_BOT_TOKEN="$(TELEGRAM_BOT_TOKEN)" \
 	  -e TELETHON_API_ID="$(TELETHON_API_ID)" \
 	  -e TELETHON_API_HASH="$(TELETHON_API_HASH)" \
