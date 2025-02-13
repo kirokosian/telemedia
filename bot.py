@@ -8,6 +8,13 @@ import asyncio
 from functools import wraps
 from datetime import datetime
 
+# ---------------------------------------------------------------------------
+# Add sickbeard_mp4_automator to sys.path so it can be imported properly.
+# ---------------------------------------------------------------------------
+sickbeard_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "sickbeard_mp4_automator")
+if sickbeard_path not in sys.path:
+    sys.path.insert(0, sickbeard_path)
+
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
@@ -20,19 +27,13 @@ from telegram.ext import (
 )
 from logging.handlers import TimedRotatingFileHandler
 
-import sys
-import os
-sickbeard_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "sickbeard_mp4_automator")
-if sickbeard_path not in sys.path:
-    sys.path.insert(0, sickbeard_path)
-
 # =============================================================================
 # Ensure /app/config exists
 # =============================================================================
 os.makedirs("/app/config", exist_ok=True)
 
 # =============================================================================
-# Logging Configuration
+# Logging Configuration (log file under /app/config)
 # =============================================================================
 log_file_path = os.path.join("/app/config", "bot.log")
 log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -41,17 +42,17 @@ log_handler.setFormatter(log_formatter)
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 logger.addHandler(log_handler)
-
 # Also log to console (optional)
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(log_formatter)
 logger.addHandler(console_handler)
 
 # =============================================================================
-# Global Job Queue (for sequential processing)
+# Global Job Queue and Progress Tracking
 # =============================================================================
-JOB_QUEUE = []            # List of job dicts.
-CURRENT_JOB_PROCESSING = False  # True when a job is being processed.
+JOB_QUEUE = asyncio.Queue()         # Jobs will be queued here.
+ACTIVE_JOBS = set()                 # Set of job_ids that are actively processing.
+PROGRESS_DICT = {}                  # Maps job_id -> progress percentage (0-100).
 
 # =============================================================================
 # Conversation States
@@ -76,6 +77,11 @@ TV_DIR = "/app/tv"
 DOWNLOADS_DIR = "/app/downloads"
 DB_FILE = "/app/db/tv_database.db"
 APPROVED_USERS_FILE = "/app/config/approved_users.txt"
+
+# =============================================================================
+# Telethon API Configuration 
+# =============================================================================
+telethon_lock = asyncio.Lock()
 
 # =============================================================================
 # Database Functions
@@ -189,31 +195,38 @@ def format_tv_filename(series_name: str, season: int, episode: int, orig_filenam
     return f"{series_name}-S{season:02d}E{episode:02d}{ext}"
 
 # =============================================================================
-# Job Processing Functions
+# Job Processing Function (with progress callback, notification, and conversion)
 # =============================================================================
 async def process_job(job: dict, context: ContextTypes.DEFAULT_TYPE):
     """
     Process a queued job:
-      - Downloads the file (using Bot API; falls back to Telethon if needed)
+      - Downloads the file (using Bot API; falls back to Telethon if needed) with progress tracking.
       - Moves/renames the file to its final destination.
       - If the final file is in MKV format, convert it to MP4 using sickbeard_mp4_automator.
+      - Notifies the user when the job is complete.
     """
     chat_id = job['chat_id']
     message_id = job['message_id']
     file_id = job['file_id']
 
-    # Determine file extension (fallback to .mp4)
+    # Determine file extension (default to .mp4)
     ext = None
     if job.get('original_filename'):
         ext = os.path.splitext(job['original_filename'])[1]
     if not ext and job.get('mime_type'):
         mime_to_ext = {"video/mp4": ".mp4", "video/x-matroska": ".mkv", "video/quicktime": ".mov"}
         ext = mime_to_ext.get(job['mime_type'], ".mp4")
-    temp_path = os.path.join(DOWNLOADS_DIR, f"temp_{file_id}{ext}")
+    temp_path = os.path.join(DOWNLOADS_DIR, f"temp_{file_id}_{job['job_id']}{ext}")
     logger.info(f"[Job {job['job_id']}] Downloading file to {temp_path}")
+
+    # Initialize progress
+    PROGRESS_DICT[job['job_id']] = 0
+
     try:
         file_obj = await context.bot.get_file(file_id)
+        # Bot API download branch (no progress callback available)
         await file_obj.download_to_drive(custom_path=temp_path)
+        PROGRESS_DICT[job['job_id']] = 100
         logger.info(f"[Job {job['job_id']}] Download via Bot API succeeded.")
     except Exception as e:
         if "File is too big" in str(e):
@@ -231,7 +244,13 @@ async def process_job(job: dict, context: ContextTypes.DEFAULT_TYPE):
                 from telethon import TelegramClient
             except ImportError:
                 raise Exception("Telethon library not installed.")
-            session = os.environ.get("TELETHON_SESSION", "bot_telethon.session")
+            
+            # Use a unique session file per job to allow concurrency:
+            session = f"bot_telethon_{job['job_id']}.session"
+            # Remove the session file if it already exists
+            if os.path.exists(session):
+                os.remove(session)
+            
             client = TelegramClient(session, telethon_api_id, TELETHON_API_HASH)
             try:
                 await client.start(bot_token=BOT_TOKEN)
@@ -242,9 +261,34 @@ async def process_job(job: dict, context: ContextTypes.DEFAULT_TYPE):
             except Exception as te:
                 await client.disconnect()
                 raise Exception(f"Telethon failed to retrieve message: {te}")
+            def progress_callback(current, total):
+                if total:
+                    percentage = int(current / total * 100)
+                else:
+                    percentage = 0
+                PROGRESS_DICT[job['job_id']] = percentage
+                        # Attempt to determine the total file size from the message:
+            total_size = None
+            if hasattr(msg, 'size') and msg.size:
+                total_size = msg.size
+            elif hasattr(msg, 'document') and msg.document and hasattr(msg.document, 'size'):
+                total_size = msg.document.size
+
+            def progress_callback(current, total):
+                if total:
+                    percentage = int(current / total * 100)
+                else:
+                    percentage = 0
+                PROGRESS_DICT[job['job_id']] = percentage
+
             try:
-                # Use download_file with part_size_kb=1024
-                await client.download_file(msg, file=temp_path, part_size_kb=1024)
+                await client.download_file(
+                    msg,
+                    file=temp_path,
+                    part_size_kb=2048,
+                    file_size=total_size,
+                    progress_callback=progress_callback
+                )
             except Exception as te:
                 await client.disconnect()
                 raise Exception(f"Telethon failed to download media: {te}")
@@ -253,7 +297,7 @@ async def process_job(job: dict, context: ContextTypes.DEFAULT_TYPE):
         else:
             raise e
 
-    # Determine destination path based on category:
+    # Determine destination path based on category
     if job['category'] == 'movie':
         dest_dir = os.path.join(MOVIES_DIR, job['movie_directory'])
         os.makedirs(dest_dir, exist_ok=True)
@@ -266,30 +310,33 @@ async def process_job(job: dict, context: ContextTypes.DEFAULT_TYPE):
         final_path = os.path.join(dest_dir, final_fname)
     else:
         raise Exception("Invalid job category.")
+    
+    # Check if the temporary file exists before moving it.
+    if os.path.exists(temp_path):
+        try:
+            shutil.move(temp_path, final_path)
+            logger.info(f"[Job {job['job_id']}] File moved to {final_path}")
+        except Exception as e:
+            raise Exception(f"Error moving file: {e}")
+    else:
+        # If the file doesn't exist, log an error and notify the user.
+        error_msg = f"Temporary file {temp_path} not found for job {job['job_id']}."
+        logger.error(error_msg)
+        raise Exception(error_msg)
 
-    try:
-        shutil.move(temp_path, final_path)
-        logger.info(f"[Job {job['job_id']}] File moved to {final_path}")
-    except Exception as e:
-        raise Exception(f"Error moving file: {e}")
-
-    # --- NEW: If the final file is an MKV, convert it to MP4 ---
+    # --- Convert MKV to MP4 if needed ---
     if final_path.lower().endswith(".mkv"):
         logger.info(f"[Job {job['job_id']}] MKV file detected; starting conversion using SMA MediaProcessor.")
         try:
             from sickbeard_mp4_automator.resources.readsettings import ReadSettings
             from sickbeard_mp4_automator.resources.mediaprocessor import MediaProcessor
 
-            # Load settings (this may come from your autoProcess.ini if available)
             settings = ReadSettings(logger=logger)
             mp = MediaProcessor(settings, logger=logger)
-
-            # Validate the file as a convertible source
             info = mp.isValidSource(final_path)
             if not info:
                 logger.error(f"[Job {job['job_id']}] File {final_path} is not a valid source for conversion.")
             else:
-                # Process the file; note: remove force_convert to match the current function signature.
                 output = mp.process(final_path, True, info=info)
                 if output and 'output' in output:
                     converted_file = output['output']
@@ -300,27 +347,35 @@ async def process_job(job: dict, context: ContextTypes.DEFAULT_TYPE):
         except Exception as conv_e:
             logger.error(f"[Job {job['job_id']}] Conversion error: {conv_e}")
 
-async def process_next_job(context: ContextTypes.DEFAULT_TYPE):
-    global JOB_QUEUE, CURRENT_JOB_PROCESSING
-    if JOB_QUEUE:
-        CURRENT_JOB_PROCESSING = True
-        job = JOB_QUEUE.pop(0)
-        logger.info(f"Processing job {job['job_id']}")
-        try:
-            await process_job(job, context)
-        except Exception as e:
-            logger.error(f"Job {job['job_id']} processing error: {e}")
-        await process_next_job(context)
-    else:
-        CURRENT_JOB_PROCESSING = False
-        logger.info("No more queued jobs.")
+    # Notify user that the job is complete
+    await context.bot.send_message(job['chat_id'], f"Download job {job['job_id']} completed. File is available at: {final_path}")
 
-def queue_job(job: dict, context: ContextTypes.DEFAULT_TYPE):
-    global JOB_QUEUE, CURRENT_JOB_PROCESSING
-    JOB_QUEUE.append(job)
-    logger.info(f"Job {job['job_id']} queued. Queue length: {len(JOB_QUEUE)}")
-    if not CURRENT_JOB_PROCESSING:
-        asyncio.create_task(process_next_job(context))
+async def worker():
+    while True:
+        job = await JOB_QUEUE.get()
+        ACTIVE_JOBS.add(job['job_id'])
+        try:
+            await process_job(job, worker_context)
+        except Exception as e:
+            logger.error(f"Error processing job {job['job_id']}: {e}")
+            await worker_context.bot.send_message(job['chat_id'], f"Job {job['job_id']} failed: {e}")
+        ACTIVE_JOBS.remove(job['job_id'])
+        JOB_QUEUE.task_done()
+
+async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status_message = "Active jobs:\n"
+    for job_id in ACTIVE_JOBS:
+        progress = PROGRESS_DICT.get(job_id, "N/A")
+        status_message += f"Job {job_id}: {progress}% downloaded\n"
+    status_message += f"\nJobs in queue: {JOB_QUEUE.qsize()}"
+    await update.message.reply_text(status_message)
+
+async def status_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await status_handler(update, context)
+
+async def queue_job(job: dict, context: ContextTypes.DEFAULT_TYPE):
+    await JOB_QUEUE.put(job)
+    logger.info(f"Job {job['job_id']} queued. Queue size: {JOB_QUEUE.qsize()}")
 
 # =============================================================================
 # Conversation Handlers – Capturing Metadata
@@ -401,7 +456,7 @@ async def movie_dir_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return WAIT_MOVIE_DIR
     context.user_data["job"]['movie_directory'] = dir_name
     logger.info(f"Job {context.user_data['job']['job_id']} movie directory set to: {dir_name}")
-    queue_job(context.user_data["job"], context)
+    await queue_job(context.user_data["job"], context)
     await update.message.reply_text("Movie job queued for processing.")
     return ConversationHandler.END
 
@@ -462,7 +517,7 @@ async def tv_new_season_episode_handler(update: Update, context: ContextTypes.DE
     logger.info(f"Job {job['job_id']} TV new series season: {season}, episode: {episode}")
     series_id = add_tv_series(job['tv_series_name'], job['tv_series_directory'])
     add_tv_episode(series_id, season, episode)
-    queue_job(job, context)
+    await queue_job(job, context)
     await update.message.reply_text("TV new series job queued for processing.")
     return ConversationHandler.END
 
@@ -551,7 +606,7 @@ async def tv_existing_episode_handler(update: Update, context: ContextTypes.DEFA
         add_tv_episode(series_id, job['season'], episode)
     else:
         logger.error("No series_id in job for existing TV series.")
-    queue_job(job, context)
+    await queue_job(job, context)
     await update.message.reply_text("TV existing series job queued for processing.")
     return ConversationHandler.END
 
@@ -563,6 +618,12 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.callback_query.edit_message_text("Operation cancelled.")
     return ConversationHandler.END
 
+async def start_worker_tasks(context: ContextTypes.DEFAULT_TYPE):
+    global worker_context
+    worker_context = context  # Save context for use by worker tasks.
+    for i in range(3):
+        asyncio.create_task(worker())
+    logger.info("Started 3 worker tasks for concurrent downloads.")
 # =============================================================================
 # Main Function
 # =============================================================================
@@ -579,6 +640,7 @@ def main() -> None:
         logger.error("No Telegram bot token provided. Set TELEGRAM_BOT_TOKEN environment variable.")
         sys.exit(1)
     application = Application.builder().token(TOKEN).build()
+
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.VIDEO, video_entry_handler)],
         states={
@@ -597,8 +659,18 @@ def main() -> None:
     )
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("cancel", cancel_handler))
+    application.add_handler(CommandHandler("status", status_command_handler))
     logger.info("Bot started polling.")
+
+    # Manually schedule the worker tasks before starting polling.
+    loop = asyncio.get_event_loop()
+    loop.create_task(start_worker_tasks(application))
+    
+    # Start polling without on_startup:
     application.run_polling()
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
